@@ -250,11 +250,13 @@ module.exports = {
 
     ctx.effect(function () {
       loadStore()
-      return ctx.webServer.register({
-        kind: 'prefix',
-        path: '/quantapi',
-        handler: async function (req, res) {
-          const pathname = String(req.url || '').split('?')[0]
+      const quantApiHandler = async function (req, res) {
+          const rawPath = String(req.url || '').split('?')[0]
+          // ★2026-08-25 前端兼容：控制页（v1.0.9）调 /niuapi/*，别名映射到 /quantapi/niu/*
+          const pathname = rawPath === '/niuapi/sessions' ? '/quantapi/niu/sessions'
+            : rawPath === '/niuapi/recent' ? '/quantapi/niu/recent'
+            : rawPath === '/niuapi/chat' ? '/quantapi/niu/chat'
+            : rawPath
           try {
             if (req.method === 'OPTIONS') {
               res.writeHead(204, CORS)
@@ -316,6 +318,18 @@ module.exports = {
               await saveStore()
               cacheSessions = null
               return sendJson(res, 200, { ok: true, restored: true })
+            }
+            if (req.method === 'POST' && pathname === '/quantapi/unlock') {
+              // ★2026-08-25 会话解锁：从面板隐藏名单移除（前端 control.html 解锁 🔒 调用）
+              const body = await readBody(req)
+              const sid = body.sessionId
+              if (!sid) return sendJson(res, 400, { ok: false, error: 'need sessionId' })
+              if (archivedIds[String(sid)]) {
+                delete archivedIds[String(sid)]
+                await saveStore()
+                cacheSessions = null
+              }
+              return sendJson(res, 200, { ok: true, unlocked: true })
             }
             if (req.method === 'POST' && pathname === '/quantapi/chat2') {
               const body = await readBody(req)
@@ -394,8 +408,10 @@ module.exports = {
           } catch (e) {
             return sendJson(res, 500, { error: String((e && e.message) || e) })
           }
-        },
-      })
+      }
+      // ★2026-08-25 双前缀注册：/quantapi/* + 控制页别名 /niuapi/*（handler 内已归一化映射）
+      ctx.webServer.register({ kind: 'prefix', path: '/niuapi', handler: quantApiHandler })
+      return ctx.webServer.register({ kind: 'prefix', path: '/quantapi', handler: quantApiHandler })
     })
   },
 }
