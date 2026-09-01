@@ -146,9 +146,11 @@ def main():
     try:
         # ★2026-08-14 超时 120→300s：incremental_daily_tushare 含 trade_cal+daily+adj_factor×2+daily_basic
         #   多次全市场调用 + 代理服务器 间歇超时重试，120s 常超 → 误走 baostock 慢兜底（几小时）
+        # ★2026-09-02 stderr 合并 stdout：FileNotFoundError 等异常不再静默（"无输出"误导了 6 个交易日）
         _rt = subprocess.run(
             [PY, "-X", "utf8", str(BASE / "data" / "incremental_daily_tushare.py")],
-            capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace")
+            capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace",
+            stderr=subprocess.STDOUT)
         _tushare_ok = _rt.returncode == 0 and ("已入库" in (_rt.stdout or ""))
         log(f"日线增量(Tushare): {(_rt.stdout or '').strip().splitlines()[-1] if (_rt.stdout or '').strip() else '无输出'}")
     except subprocess.TimeoutExpired:
@@ -177,6 +179,10 @@ def main():
                  [PY, "-X", "utf8", str(_sched), "daily"], timeout=2700)
     else:
         log("  ⚠ 外包因子池 scheduler 不存在（路径变更？）→ 跳过补跑")
+    # 2.8) ★2026-09-02 因子池清单落盘（接 builtin_purify 到 daily_pipeline，外包缺失时走内建）
+    run_step("因子池清单", [PY, "-X", "utf8", str(BASE / "data" / "factorpool" / "build_pool.py")], timeout=60)
+    # 2.9) ★2026-09-02 今日信号聚合（7 源 → daily_signal.json，替换 live_holdings 红绿灯 fallback）
+    run_step("今日信号聚合", [PY, "-X", "utf8", str(BASE / "report" / "daily_signal.py")], timeout=60)
     # 3) 健康巡检
     health_check()
     # 3.5) ★竞价强度信号（T-3 交付物，2026-08-09 接入：分钟增量入库后自动算近 3 月信号存档）
@@ -222,6 +228,8 @@ def main():
     run_step("三层池（观察/候选/决策）", [PY, "-X", "utf8", str(BASE / "strategy" / "pool_layers.py"),
               "--n", "100", "--capital", "200000", "--regime-cash", "0.3"], timeout=1800)
     run_step("今日信号（择时/审计）", [PY, "-X", "utf8", str(BASE / "report" / "daily_signal.py")], timeout=1800)
+    # ★2026-08-25 快照本地重建（外包 factorpool 缺失）：择时风格/宽度 v2 数据源，必须在择时系统前跑
+    run_step("市场快照重建（风格/宽度）", [PY, "-X", "utf8", str(BASE / "data" / "rebuild_market_snapshot.py")], timeout=600)
     run_step("新择时系统（适合买入判断）", [PY, "-X", "utf8", str(BASE / "factors" / "policy" / "timing_system.py")], timeout=300)
     run_step("组合风控（集中度/行业上限）", [PY, "-X", "utf8", str(BASE / "risk" / "position_monitor.py")], timeout=300)   # ★2026-08-11 百轮#11
     run_step("远期池 T+1 填充", [PY, "-X", "utf8", str(BASE / "factors" / "opportunities" / "pitch_track.py")], timeout=1800)

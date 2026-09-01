@@ -19,7 +19,7 @@ harness/home/.credentials.yaml
 
 # ---- 数据（Tushare 协议：不得再分发；请自行获取） ----
 data/cache/
-data/factorpool/
+data/factorpool/output/
 data/trash/
 *.db
 *.sqlite
@@ -29,7 +29,7 @@ data/trash/
 # ---- 运行产物 ----
 logs/
 output/
-report/
+report/daily_report_*.md
 deck/dashboard_*_20*.html
 deck/*.json
 

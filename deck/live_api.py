@@ -23,6 +23,10 @@ _fwd_cache = {"ts": 0, "data": None}
 _cal_cache = {"ts": 0, "data": None}   # ★#150 日历缓存（数据源版本 5min）
 _alrt_cache = {"ts": 0, "data": None}  # ★#150 预警缓存（数据源版本 2min）
 _chain_cache = {"ts": 0, "data": None} # ★#150 决策链缓存（数据源版本 2min）
+# ★2026-08-25 P2：未实现模块显式标注——signal/audit/factor_pool/pool_layers/beneish/sim_tracks
+#   在项目里从未实现（v1.0.9 规划外），api_health 不再以 online:false/stale:true 占位
+#   （前端会误读为延迟/故障），统一返回 implemented=false + note
+UNIMPLEMENTED_MODULES = {"signal", "audit", "factor_pool", "pool_layers", "beneish", "sim_tracks"}
 
 
 def _latest_file(pattern: str, subdir: str = "logs") -> Path:
@@ -489,6 +493,31 @@ def live_holdings() -> dict:
             sa["entries"] = [e for e in sa["entries"] if e.get("code") in _held_codes]
     except Exception:
         pass
+    # ★2026-08-25 daily_signal 生成器（report/daily_signal.py）从未入库 → 死源；
+    #   fallback 红绿灯 + 仓位档拼最小 regime 信号（前端 regime_label/level/cash_ratio）
+    # ★2026-09-02 优先读 daily_signal.json（聚合 7 源）；仅在缺失时才走红绿灯兜底
+    if not ds:
+        try:
+            _ds = json.loads((BASE / "output" / "daily_signal.json").read_text(encoding="utf-8"))
+            ds = {"date": _ds.get("date"), "source": "daily_signal",
+                  "regime_label": _ds.get("regime_label"), "regime_state": _ds.get("regime_state"),
+                  "regime_level": _ds.get("regime_level"),
+                  "regime_cash_ratio": _ds.get("regime_cash_ratio"),
+                  "composite_level": _ds.get("composite_level"),
+                  "dims": _ds.get("dims"),
+                  "note": "来自 report/daily_signal.py 聚合（7 源）"}
+        except Exception:
+            try:
+                _tl = json.loads((BASE / "output" / "traffic_light.json").read_text(encoding="utf-8"))
+                _rg = json.loads((BASE / "output" / "dynamic_regime.json").read_text(encoding="utf-8"))
+                _cur = _rg.get(datetime.now().strftime("%Y-%m"), {})
+                ds = {"date": _tl.get("asof"), "source": "traffic_light_fallback",
+                      "regime_label": _tl.get("label"), "regime_state": _tl.get("state"),
+                      "regime_level": _cur.get("level"),
+                      "regime_cash_ratio": round(1 - float(_cur.get("pos", 0.0)), 2),
+                      "note": "daily_signal.json 缺失，降级自择时红绿灯/仓位档"}
+            except Exception:
+                ds = None
     return {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1080,7 +1109,12 @@ def portfolio_perf() -> dict:
             inc = sorted(_g.glob("data/cache/bars_incr_*.db"))[-3:]
             return dbs + inc
         def _ro(p):
-            return f"{_P(p).as_uri()}?mode=ro&immutable=1"
+            # ★2026-08-25 修复：相对路径 as_uri() 恒抛 ValueError，被 except 静默吞掉
+            #   → 持仓行情一条都拉不到 → 净值曲线恒空（"净值数据积累中"假象）。改 BASE 绝对路径。
+            _q = _P(p)
+            if not _q.is_absolute():
+                _q = _P(BASE) / _q
+            return f"{_q.as_uri()}?mode=ro&immutable=1"
         def _fetch(code, ed, adjust="qfq"):
             out = {}
             for db in _dbs():
@@ -2764,7 +2798,7 @@ def live_factor_dash() -> dict:
     out = {"ok": True, "schema_version": "1.0", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     _SD = "data/factorpool/output"
     try:
-        # 1) manifest 全因子（mtime 取最新）
+        # 1) manifest 全因子（mtime 取最新；外包缺失 → 内建净化清单兜底）
         _mf = sorted(glob.glob(_SD + "/factor_manifest_*.json"), key=os.path.getmtime)
         if _mf:
             _mj = json.loads(Path(_mf[-1]).read_text(encoding="utf-8"))
@@ -2780,7 +2814,15 @@ def live_factor_dash() -> dict:
             for f in _mj.get("factors", []):
                 c = f.get("category", "其他")
                 out["categories"][c] = out["categories"].get(c, 0) + 1
-        # 2) health 体检（mtime 取最新）
+        else:
+            # ★自算净化：外包因子池未接入 → 用主系统自有因子知识生成内建净化清单
+            from factors.pool.builtin_purify import build_manifest
+            _bm = build_manifest()
+            if _bm["factors"]:
+                out["manifest"] = _bm
+                out["categories"] = _bm["categories"]
+                out["source"] = "builtin"
+        # 2) health 体检（mtime 取最新；外包缺失且已走内建 → 同源回退）
         _hf = sorted(glob.glob(_SD + "/health/health_*.csv"), key=os.path.getmtime)
         if _hf:
             import csv as _csv
@@ -2789,6 +2831,11 @@ def live_factor_dash() -> dict:
                 "date": _rows[0].get("test_date") or _rows[0].get("last_date") if _rows else "",
                 "n": len(_rows), "rows": _rows,
             }
+        elif out.get("source") == "builtin":
+            from factors.pool.builtin_purify import build_health
+            _bh = build_health()
+            if _bh["rows"]:
+                out["health"] = _bh
         # 3) 反向 flag 命中（daily CSV 最新，flag_ 列计数）
         _df = sorted(glob.glob(_SD + "/daily_scores/daily_*.csv"), key=os.path.getmtime)
         if _df:
@@ -2939,6 +2986,20 @@ def live_portal_dash() -> dict:
         # ★#347 API/数据源健康（各关键数据文件新鲜度——门户"当前 API 状态"）
         from deck.system_live import _api_health
         out["api_health"] = _api_health()
+        # ★2026-08-25 P2：未实现模块显式标注（同 live_holdings daily_signal fallback 风格）
+        #   集合内模块从未实现 → implemented=false + note，不显示 online:false/stale:true 占位；
+        #   不在集合内的模块保持 _api_health 原判断（文件缺失 = 真正离线 stale:true）
+        try:
+            for _m in UNIMPLEMENTED_MODULES:
+                out["api_health"][_m] = {
+                    "online": False,
+                    "age_h": None,
+                    "stale": False,
+                    "implemented": False,
+                    "note": "模块未实现（v1.0.9 规划外）",
+                }
+        except Exception:
+            pass
     except Exception:
         pass
     try:
