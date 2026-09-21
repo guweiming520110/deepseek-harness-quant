@@ -180,11 +180,18 @@ def macro_score() -> dict:
             return {"score": 50, "note": "无择时信号（中性）"}
         d = json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
         rl = d.get("regime_label", "")
+        # ★2026-09-21 兼容红绿灯三态（traffic_light v2）：daily_signal 的 regime_label 现输出
+        #   贪婪/观望/恐慌中文（词=系统风险/乖离），已不再产出英文趋势五档——五档映射全部 miss 恒 50。
+        #   红绿灯→宏观分（越高越适合买入）：贪婪=趋势强势偏热75、观望=震荡55、恐慌=系统性风险15。
         mapping = {"strong_uptrend": 90, "uptrend": 75, "choppy": 55,
-                   "downtrend": 30, "strong_downtrend": 15}
+                   "downtrend": 30, "strong_downtrend": 15,
+                   "greedy": 75, "wait": 55, "panic": 15,
+                   "贪婪": 75, "观望": 55, "恐慌": 15}
         sc = mapping.get(rl, 50)
         _rl_cn = {"strong_uptrend": "强势上行", "uptrend": "上行", "choppy": "震荡",
-                  "downtrend": "下行", "strong_downtrend": "弱势下行"}.get(rl, "中性")
+                  "downtrend": "下行", "strong_downtrend": "弱势下行",
+                  "greedy": "贪婪", "wait": "观望", "panic": "恐慌",
+                  "贪婪": "贪婪", "观望": "观望", "恐慌": "恐慌"}.get(rl, "中性")
         note = f"Regime={rl}"
         # ★#105 真实宏观库修正（macro.db immutable）
         try:
@@ -287,18 +294,17 @@ def sentiment_score() -> dict:
         n = len(rows)
         lu = sum(1 for r in rows if r[0] and r[1] and r[0] / r[1] >= 1.097)
         lu_pct = lu / n * 100
+        # ★2026-09-21 方向对齐主口径：外包温度计"越低越恐慌=买入区"（恐慌底部90/偏冷70/中性50/偏热30/过热15）。
+        #   原 bars 兜底沿用旧反向逻辑（涨停越多分越高=活跃 85）会推反汇总档位——改同向档位映射，
+        #   且 short 换结论词（原恒硬编码"涨停情绪"指标名，69分与25分都显示"涨停情绪"误导）。
         if lu_pct >= 4:
-            sc = max(20, 75 - (lu_pct - 4) * 15)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）过热降温"
+            sc, short, note = 15, "过热", f"涨停 {lu} 只（{lu_pct:.1f}%）过热"
         elif lu_pct >= 1.5:
-            sc = min(85, 55 + lu_pct * 8)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪活跃"
+            sc, short, note = 30, "偏热", f"涨停 {lu} 只（{lu_pct:.1f}%）偏热"
         elif lu_pct >= 0.5:
-            sc = 45
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪平淡"
+            sc, short, note = 50, "中性", f"涨停 {lu} 只（{lu_pct:.1f}%）中性"
         else:
-            sc = 25
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪冰点"
+            sc, short, note = 90, "恐慌", f"涨停 {lu} 只（{lu_pct:.1f}%）恐慌冰点（买入区）"
         vols = [r[2] for r in rows if r[2]]
         if vols:
             import statistics
@@ -307,7 +313,7 @@ def sentiment_score() -> dict:
             temp = "量能适中" if 0.8 < vs / (vm + 1e-9) < 1.3 else ("量能放大" if vs / (vm + 1e-9) >= 1.3 else "量能萎缩")
             note += f"｜{temp}"
         note += "（bars 兜底）"
-        return {"score": round(sc, 1), "note": note, "short": "涨停情绪"}
+        return {"score": round(sc, 1), "note": note, "short": short}
     except Exception as e:
         return {"score": 50, "note": f"情绪分异常（{str(e)[:40]}）"}
 
