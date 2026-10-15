@@ -64,6 +64,11 @@ def main():
     #   → bars.db 停在 09-18。现超时 1200s 仅兜底极端情况（源库 malformed 重试等）。
     run_step("D盘行情同步", [PY, "-X", "utf8", str(BASE / "data" / "import_from_ddrive.py")],
              timeout=1200)
+    # 1.5) ★2026-10-16 ST 标记同步：D 盘源库无 ST 历史 → 导入时 is_st 恒 0
+    #   → load_st_codes() 回溯也找不到 → ST 过滤静默失效。用 stock_basic.name 补标记（本地秒级）。
+    #   必须紧跟在行情同步后（增量导入会把新行 is_st 重置为 0）。
+    run_step("ST标记同步", [PY, "-X", "utf8", str(BASE / "data" / "sync_st_flags.py"),
+                        "--days", "10"], timeout=300)
     # 2) D 盘财报同步（幂等，约 20 秒）
     run_step("D盘财报同步", [PY, "-X", "utf8", str(BASE / "data" / "import_finance_from_ddrive.py")],
              timeout=600)
