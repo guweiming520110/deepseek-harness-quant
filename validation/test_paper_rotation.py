@@ -3,6 +3,8 @@
 对应实施计划 docs/plans/2026-10-16-paper-rotation.md
 设计文档 docs/plans/2026-10-16-paper-rotation-design.md
 """
+# pyright: reportMissingImports=false
+# ↑ strategy.* 由 pytest rootdir 注入 sys.path，静态分析不可见（运行时正常）
 from pathlib import Path
 
 import yaml

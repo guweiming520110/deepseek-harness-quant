@@ -3168,7 +3168,8 @@ def _spot_valid(df) -> bool:
     price = pd.to_numeric(df.get("最新价"), errors="coerce") if "最新价" in df.columns else None
     if price is None or price.notna().sum() < max(1, len(df) * 0.5):
         return False
-    return int((price > 0).sum()) >= max(1, len(df) * 0.5)
+    n_up = (price > 0).sum()          # pandas int64 —— 无需 int() 转换/异常处理
+    return bool(n_up >= max(1, len(df) * 0.5))
 
 
 def _load_real_spot():
