@@ -33,17 +33,24 @@ sys.path.insert(0, str(BASE))
 import numpy as np
 import pandas as pd
 
-BARS_DB = Path(r"D:/劳威派量化数据/cache/bars.db")
-FIN_DB = Path(r"D:/劳威派量化数据/cache/finance.db")
-BASIC_DB = Path(r"D:/劳威派量化数据/cache/stock_basic.db")
-MV_CSV = Path(r"D:/劳威派量化数据/cache/circ_mv_map_full.csv")
+# ★2026-10-16 修复：原硬编码 D:/劳威派量化数据/cache/（2026-08-22 迁 G 盘时遗漏此文件），
+#   该目录已不存在 → load_close_panel 抛 "unable to open database file" → 三层池长期无产物
+#   （门户“观察池数据不通”）。改走 data.cache.CACHE_DIR（唯一读取接口、配置驱动），
+#   符合项目铁律“数据/路径不写死”。
+from data.cache import CACHE_DIR
+
+BARS_DB = CACHE_DIR / "bars.db"
+FIN_DB = CACHE_DIR / "finance.db"
+BASIC_DB = CACHE_DIR / "stock_basic.db"
+MV_CSV = CACHE_DIR / "circ_mv_map_full.csv"
 
 
 def load_close_panel(days=300, end=None) -> pd.DataFrame:
     """近 N 个交易日全市场 close+volume 面板（date × code，qfq）
     ★2026-08-07 扩展：days 默认 130→300（决策池技术确认需要 MA200/52 周高点）；
     返回 (close_df, volume_df) 双面板"""
-    con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
+    # ★2026-10-16：URI 用 Path.as_uri()（原 f"file:{路径}" 不转义 Windows 反斜杠/空格/中文 → 打不开）
+    con = sqlite3.connect(BARS_DB.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
     # ★#143 双库合并：主库写保护后增量库含最新日（08-12 起排行不虚标旧日）
     if end:
         last = con.execute(
@@ -56,7 +63,7 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
             from pathlib import Path as _P
             for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
                 try:
-                    _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
+                    _c = sqlite3.connect(_P(_p).as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
                     _m = _c.execute(
                         "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
                     _c.close()
@@ -66,18 +73,27 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
                     pass
         except Exception:
             pass
+    # ★2026-10-16 性能修复：原「date<=last」= 读全表（1386 万行）再 pivot 5000+ 列
+    #   → 数分钟/超时（三层池长期跑不出产物）。改只取最后 days 个交易日，
+    #   结果等价（原逻辑同样读全表 pivot 后再 tail(days)）。
+    _dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM daily_bar WHERE adjust='qfq' AND date<=? "
+        "ORDER BY date DESC LIMIT ?", (last, days))]
+    win_start = min(_dates) if _dates else last
     df = pd.read_sql(
         "SELECT date, code, close, volume, high, low FROM daily_bar "
-        "WHERE adjust='qfq' AND date<=? AND close>0", con, params=(last,))
+        "WHERE adjust='qfq' AND date>=? AND date<=? AND close>0",
+        con, params=(win_start, last))
     # ★#143 增量库数据补充（增量行覆盖主库同 key）
     try:
         from pathlib import Path as _P
         for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
             try:
-                _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
+                _c = sqlite3.connect(_P(_p).as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
                 _df2 = pd.read_sql(
                     "SELECT date, code, close, volume, high, low FROM daily_bar "
-                    "WHERE adjust='qfq' AND date<=? AND close>0", _c, params=(last,))
+                    "WHERE adjust='qfq' AND date>=? AND date<=? AND close>0",
+                    _c, params=(win_start, last))
                 if len(_df2):
                     df = pd.concat([df, _df2], ignore_index=True).drop_duplicates(
                         subset=["date", "code"], keep="last")
@@ -99,7 +115,16 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
 
 
 def load_fundamentals(end=None) -> pd.DataFrame:
-    """最新一期财报基本面（roe / sq_net_yoy，PIT：period <= end）"""
+    """最新一期财报基本面（roe / sq_net_yoy，PIT：period <= end）
+
+    ★2026-10-16 修复两处口径不一致（导致 rank() 硬筛选清空 → 三层池长期 0 只）：
+      ① index：原返回带后缀 code（'000001.SZ'），而 rank 用 6 位 code6 对齐 →
+         merge 全失败 → roe/nyoy 全 NaN → f_valid 为空 → n=0。现规范化为 6 位。
+      ② roe 单位：finance_report.roe 存百分点（4.6746=4.67%），rank 按小数处理
+         （f["roe"]>=0.05 即 5%、输出 ×100）→ 现 ÷100 归一为小数口径；nyoy 保持百分点
+         （rank 侧即按百分点用：>0 筛选、直接输出）。
+      注：本函数仅 strategy 侧 rank() 使用；factors/opportunities/scan.py 另有独立同名
+      函数（被 market_env/breakout_monitor/pitch_replay 使用），不在本次修改范围。"""
     con = sqlite3.connect(str(FIN_DB))
     sql = """SELECT f.code, f.period, f.roe, f.sq_net_yoy, f.revenue, f.net_profit
              FROM finance_report f
@@ -110,6 +135,9 @@ def load_fundamentals(end=None) -> pd.DataFrame:
     con.close()
     df = df.drop_duplicates("code")
     df = df.rename(columns={"sq_net_yoy": "nyoy"})
+    df["code"] = df["code"].astype(str).str[:6]                      # 与 rank 的 code6 对齐
+    # 百分点 → 小数（np.asarray 显式转 float64：绕开 pandas 存根对 to_numeric 的联合返回类型推断）
+    df["roe"] = np.asarray(pd.to_numeric(df["roe"], errors="coerce"), dtype=float) / 100.0
     return df.set_index("code")
 
 
@@ -120,7 +148,7 @@ def load_basic() -> pd.DataFrame:
     return df.set_index("code")
 
 
-def rank(date: str = None, n: int = 30) -> dict:
+def rank(date: "str | None" = None, n: int = 30) -> dict:
     # ★U1-3 日期口径修复（2026-08-10）：默认 date 用 bars 最近交易日（原用今天日期 →
     #   周末/数据未更新时虚标，pool_layers 观察池显示 08-10 实际数据只有 08-07）
     # ★第四十波：改双库合并探测（主库 08-07 + 增量库 08-10）
@@ -189,8 +217,9 @@ def rank(date: str = None, n: int = 30) -> dict:
         try:
             m = pd.read_csv(MV_CSV, encoding="utf-8-sig")
             mv = {str(r.ts_code).upper(): float(r.circ_mv) / 10000 for r in m.itertuples()}
-        except Exception:
-            pass
+        except Exception as e:
+            # 读取失败不阻断排名（mv_yi 留空，仅信息展示用），但显式提示、不静默
+            print(f"[rank] 市值快照读取失败（mv_yi 留空）: {str(e)[:60]}")
     f["mv_yi"] = pd.Series(mv).reindex(f.index)
 
     # ---- 数据清洗（优中选优前提：盈利 + 无脏数据）----
