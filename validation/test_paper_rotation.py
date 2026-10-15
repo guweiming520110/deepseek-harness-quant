@@ -17,7 +17,7 @@ def _cfg():
 def test_config_paper_rotation_present_and_defaults():
     pr = _cfg().get("paper_rotation")
     assert isinstance(pr, dict)
-    assert pr["enabled"] is False            # 默认关闭，需显式开启
+    assert isinstance(pr["enabled"], bool)  # 可开关（当前已按用户要求启用为 True）
     assert pr["account_name"] == "rotation"  # 独立账户，不碰 default
     assert pr["initial_cash"] == 1000000
     assert pr["max_positions"] == 6
@@ -148,6 +148,23 @@ def test_buy_excludes_already_held():
     plan = pr.compute_buys(ranked_codes=ranked, scores=scores, holds=holds, cfg=cfg,
                            cash=500_000, equity=1_000_000)
     assert "A.SZ" not in [b["code"] for b in plan["buys"]]
+
+
+def test_pending_exec_date_is_inclusive_and_sorted(tmp_path):
+    """load_pending 取 exec_date <= 指定日（含停牌/无行情顺延的旧单）；同日先卖后买"""
+    import strategy.paper_rotation as pr
+    db = tmp_path / "paper.db"
+    pr.ensure_pending_table(db)
+    pr.write_pending(db, "2026-10-14", "2026-10-14", [
+        {"code": "A.SZ", "side": "buy", "qty": 100, "reason": "new_entry"},
+        {"code": "B.SZ", "side": "sell", "qty": 200, "reason": "rank_decay"}])
+    pr.write_pending(db, "2026-10-15", "2026-10-15", [
+        {"code": "C.SZ", "side": "buy", "qty": 300, "reason": "new_entry"}])
+    rows = pr.load_pending(db, "2026-10-15")
+    assert len(rows) == 3                                   # 含 10-14 的顺延单
+    assert rows[0]["side"] == "sell"                        # 同日先卖后买
+    assert {r["exec_date"] for r in rows} == {"2026-10-14", "2026-10-15"}
+    assert len(pr.load_pending(db, "2026-10-14")) == 2       # 只取 <= 10-14
 
 
 def test_run_once_dry_run_writes_nothing():

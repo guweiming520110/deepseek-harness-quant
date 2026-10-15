@@ -104,15 +104,18 @@ def write_pending(db_path, signal_date: str, exec_date: str, orders: list) -> in
 
 
 def load_pending(db_path, exec_date: str) -> list:
-    """读某成交日的待执行订单（side DESC → sell 在前，先卖后买）
+    """读 exec_date **<= 指定日** 的待执行订单（含停牌/无行情顺延的旧单；先卖后买）
+
+    语义：exec_date = 订单的「意图成交日」。晨更链 09:10 时当日行情尚不可得
+    （源库次日落库）→ 执行时用**订单自身 exec_date 的开盘价**撮合。
     表/库不存在 → 返回 []（首次运行/dry-run 安全，不抛异常）"""
     if not Path(db_path).exists():
         return []
     con = sqlite3.connect(str(db_path))
     try:
         cur = con.execute(
-            "SELECT code, side, qty, reason FROM rotation_pending WHERE exec_date=? "
-            "ORDER BY side DESC, code", (exec_date,))
+            "SELECT exec_date, code, side, qty, reason FROM rotation_pending "
+            "WHERE exec_date<=? ORDER BY exec_date, side DESC, code", (exec_date,))
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
     except sqlite3.OperationalError:
@@ -194,6 +197,21 @@ def compute_buys(ranked_codes: list, scores: dict, holds: list, cfg: dict,
 BARS_DB = BASE / "data" / "cache" / "bars.db"
 
 
+def _latest_bars_date() -> str:
+    """bars.db 最新股票交易日（晨更链 09:10 时通常为前一交易日）；无数据 → "" """
+    if not BARS_DB.exists():
+        return ""
+    con = sqlite3.connect(f"file:{BARS_DB.as_posix()}?mode=ro&immutable=1",
+                          uri=True, timeout=5)
+    try:
+        r = con.execute(
+            "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq' "
+            "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%'").fetchone()
+        return str(r[0]) if r and r[0] else ""
+    finally:
+        con.close()
+
+
 def _ranked_codes(scores: dict) -> list:
     """短线分数降序的 code 列表"""
     return [c for c, _ in sorted(scores.items(),
@@ -237,9 +255,10 @@ def _trade_days_held(entry_date: str, today: str) -> int:
         con.close()
 
 
-def _pending_codes(exec_date: str) -> set:
+def _pending_codes(upto: str) -> set:
+    """未成交 pending 涉及的 code（供取行情用）"""
     try:
-        return {o["code"] for o in load_pending(PAPER_DB, exec_date)}
+        return {o["code"] for o in load_pending(PAPER_DB, upto)}
     except Exception:
         return set()
 
@@ -261,25 +280,31 @@ def _to_hold_rows(acc, today: str, bars: dict) -> list:
     return rows
 
 
-def _execute_pending(acc, today: str, bars: dict, dry_run: bool) -> list:
-    """用今日开盘价撑合上一轮写入的 pending；一字板 → 作废，无行情 → 顺延"""
+def _execute_pending(acc, dry_run: bool) -> list:
+    """执行「意图成交日 <= bars.db 最新日」的 pending —— 用**订单自身 exec_date 的开盘价**
+    撮合（晨更链 09:10 拿不到当日行情，故按订单日取价；信号更早，天然无前视）。
+    一字板 → 作废；该日无行情（停牌）→ 顺延（仍在队列，下次重试）。
+    """
+    latest = _latest_bars_date()
+    if not latest:
+        return []
     done = []
-    for o in load_pending(PAPER_DB, exec_date=today):
-        bar = bars.get(o["code"]) or {}
+    for o in load_pending(PAPER_DB, latest):
+        bar = (_bars_for([o["code"]], o["exec_date"]) or {}).get(o["code"]) or {}
         if is_limit_locked(bar):
-            print(f"[paper_rotation] {o['code']} {o['side']} 一字板 → 作废")
+            print(f"[paper_rotation] {o['code']} {o['side']} {o['exec_date']} 一字板 → 作废")
             continue
         px = bar.get("open")
         if not px:
-            print(f"[paper_rotation] {o['code']} 无当日行情 → 顺延")
+            print(f"[paper_rotation] {o['code']} {o['exec_date']} 无行情 → 顺延")
             continue
         if dry_run:
             done.append({**o, "px": px})
             continue
         if o["side"] == "buy":
-            r = acc.buy(o["code"], int(o["qty"]), today, float(px), o.get("reason", ""))
+            r = acc.buy(o["code"], int(o["qty"]), o["exec_date"], float(px), o.get("reason", ""))
         else:
-            r = acc.sell(o["code"], int(o["qty"]), today, float(px), o.get("reason", ""))
+            r = acc.sell(o["code"], int(o["qty"]), o["exec_date"], float(px), o.get("reason", ""))
         if not (r or {}).get("ok"):
             print(f"[paper_rotation] {o['code']} {o['side']} 撑合失败: {(r or {}).get('msg')}")
         done.append({**o, "px": px})
@@ -306,15 +331,17 @@ def run_once(dry_run: bool = False, today: "str | None" = None) -> dict:
     if not dry_run:
         ensure_pending_table(PAPER_DB)
 
-    # ① 执行上一轮 pending（今日开盘价）
+    # 成交/行情基准日 = bars.db 最新股票交易日（晨更链 09:10 时通常为前一交易日）
+    bars_date = _latest_bars_date() or today
+    # ① 执行 pending（用订单自身 exec_date 的开盘价；数据次日可得 → 天然无前视）
+    executed = _execute_pending(acc, dry_run)
     codes = {p.get("code") for p in (acc.positions() or [])}
-    codes |= _pending_codes(today)
+    codes |= _pending_codes(bars_date)
     codes |= set(ranked[:top_n * 3])
-    bars = _bars_for(sorted(c for c in codes if c), today)
-    executed = _execute_pending(acc, today, bars, dry_run)
+    bars = _bars_for(sorted(c for c in codes if c), bars_date)
 
     # ② 卖出（4 级优先级）
-    holds = _to_hold_rows(acc, today, bars)
+    holds = _to_hold_rows(acc, bars_date, bars)
     sell_plan = compute_sells(holds, scores, cfg, ranked)
     kept = list(sell_plan["kept"])
     sells = list(sell_plan["sells"])
@@ -356,9 +383,8 @@ def run_once(dry_run: bool = False, today: "str | None" = None) -> dict:
             orders.append({"code": b["code"], "side": "buy",
                            "qty": qty, "reason": b["reason"]})
     if not dry_run and orders:
-        import datetime as _dt2
-        exec_date = (_dt2.date.fromisoformat(today) + _dt2.timedelta(days=1)).strftime("%Y-%m-%d")
-        write_pending(PAPER_DB, today, exec_date, orders)
+        # exec_date = 出单当日（= 意图成交日）：次日数据落库后按该日开盘价撑合
+        write_pending(PAPER_DB, today, today, orders)
 
     return {"ok": True, "dry_run": dry_run, "date": today,
             "pending_executed": executed, "sells": sells,
