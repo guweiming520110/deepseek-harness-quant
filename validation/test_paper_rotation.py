@@ -34,3 +34,20 @@ def test_config_example_has_same_keys():
     b = yaml.safe_load((BASE / "config" / "params.yaml.example")
                        .read_text(encoding="utf-8"))["paper_rotation"].keys()
     assert set(a) == set(b)
+
+
+def test_load_rotation_cfg_defaults_when_missing(tmp_path):
+    import strategy.paper_rotation as pr
+    cfg = pr.load_rotation_cfg(path=tmp_path / "nonexistent.yaml")
+    assert cfg["max_positions"] == 6 and cfg["enabled"] is False   # 缺省兜底不崩
+
+
+def test_load_shortline_scores_parses_entries():
+    import strategy.paper_rotation as pr
+    scores = pr.load_shortline_scores()          # 读 logs/tech_pitch_*.json（取 mtime 最新）
+    assert isinstance(scores, dict)              # {code: {"score", "name", ...}}
+    for code, v in scores.items():
+        assert isinstance(code, str) and code.count(".") == 1
+        assert isinstance(v["score"], (int, float))
+    # 文件不存在时必须返回空 dict（不抛异常）
+    assert pr.load_shortline_scores(pattern="logs/__no_such__*.json") == {}
