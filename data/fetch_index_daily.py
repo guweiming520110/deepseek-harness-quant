@@ -1,20 +1,24 @@
-"""data/fetch_index_daily.py — 基准指数日线增量更新（Regime 择时数据源）
+"""data/fetch_index_daily.py — 基准指数日线（Regime 择时数据源）
 
-Regime 择时基于沪深300 日线（bars.db SH.000300）。本脚本每日收盘后增量拉取
-最近 N 个交易日数据入库，确保择时信号使用到最新收盘价。
+Regime 择时基于沪深300 日线（bars.db SH.000300），本脚本拉取并入库。
 
 用法：
-  python data/fetch_index_daily.py              # 增量拉取（默认最近 15 个交易日）
-  python data/fetch_index_daily.py --days 60    # 拉取 60 天（补缺口）
-  python data/fetch_index_daily.py --days 2000  # 回补历史（自动分段，见 ★2026-10-16）
+  python data/fetch_index_daily.py                    # 增量（最近 15 个交易日）
+  python data/fetch_index_daily.py --days 250         # 最近 250 个交易日
+  python data/fetch_index_daily.py --start 2018-01-01 --end 2018-12-31   # 指定区间（回补）
 
-★2026-10-16 分段拉取：baostock 单次拉大范围（如 2000 天）会报 "10002007 网络接收错误"
-  → 按 --chunk（默认 250 交易日 ≈ 400 自然日）逐段回溯，段间幂等 upsert。
+★2026-10-16 回补历史须知（实测结论）：
+  baostock 单次查询范围过大（如一次拉 8 年）会被服务端拒（10002007 网络接收错误）；
+  同一会话内连续多次查询同样会被拒。而「每段 ≤1 年 + 每段独立进程（新会话）」的
+  成功率实测 100%（2018/2020/2022/2023 各期单查均成功）。
+  故回补历史请按年分段、逐段调用本脚本（各段 upsert 幂等，可重复运行），例如：
+    for y in 2018 2019 2020 2021 2022 2023 2024 2025; do
+      python -X utf8 data/fetch_index_daily.py --start ${y}-01-01 --end ${y}-12-31
+    done
 """
 import argparse
 import os
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -31,41 +35,29 @@ INDEX_CODES = ["sh.000300"]          # 沪深300（Regime 基准）
 CODE_ALIAS = {"sh.000300": "SH.000300"}
 
 
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, default=15, help="拉取最近 N 个交易日")
-    ap.add_argument("--chunk", type=int, default=250,
-                    help="分段大小（交易日；baostock 单次大范围易网络超时）")
+    ap.add_argument("--days", type=int, default=15, help="拉取最近 N 个交易日（单段）")
+    ap.add_argument("--start", type=str, default=None, help="区间起点 YYYY-MM-DD（与 --end 搭配）")
+    ap.add_argument("--end", type=str, default=None, help="区间终点 YYYY-MM-DD")
     args = ap.parse_args()
 
-    cache = DailyCache()
+    if args.start and args.end:
+        start, end = args.start, args.end
+    else:
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=int(args.days * 1.6) + 5)).strftime("%Y-%m-%d")
 
+    cache = DailyCache()
     for code in INDEX_CODES:
-        # ★2026-10-16 分段回溯：单次 8 年拉取会 "10002007 网络接收错误"，按 chunk 逐段拉。
-        remain = args.days
-        cur_end = datetime.now()
-        total = 0
-        failed = 0
-        while remain > 0:
-            n = min(args.chunk, remain)
-            span = int(n * 1.6) + 5          # 交易日 → 自然日（含周末/节假日冗余）
-            seg_start = (cur_end - timedelta(days=span)).strftime("%Y-%m-%d")
-            seg_end = cur_end.strftime("%Y-%m-%d")
-            try:
-                df = fetch_daily(code, start_date=seg_start, end_date=seg_end, adjust="none")
-                if df is not None and not df.empty:
-                    total += cache.put_daily(CODE_ALIAS[code], df, adjust="none", source="baostock")
-            except Exception as e:
-                # ★baostock 服务端不稳定（实测 10002007 网络接收错误）→ 单段失败不中断；
-                #   upsert 幂等，重跑本命令即可逐步续拉补齐。
-                failed += 1
-                print(f"  ⚠ {seg_start}~{seg_end} 失败（{str(e)[:50]}）→ 跳过，可重跑续拉")
-            cur_end = cur_end - timedelta(days=span)
-            remain -= n
-            time.sleep(0.5)              # 段间轻微延迟，降低 baostock 瞬时压力
+        df = fetch_daily(code, start_date=start, end_date=end, adjust="none")
+        if df is None or df.empty:
+            print(f"{code}: 无数据（{start}~{end}）")
+            continue
+        n = cache.put_daily(CODE_ALIAS[code], df, adjust="none", source="baostock")
         rng = cache.get_meta(CODE_ALIAS[code], "none") or {}
-        print(f"{code}: 写入 {total} 行（失败段 {failed}）→ "
-              f"{rng.get('start_date')} ~ {rng.get('end_date')} 累计 {rng.get('rows')} 行")
+        print(f"{code}: 写入 {n} 行（{start}~{end}）→ 累计 {rng.get('rows')} 行 "
+              f"[{rng.get('start_date')} ~ {rng.get('end_date')}]")
     return 0
 
 
