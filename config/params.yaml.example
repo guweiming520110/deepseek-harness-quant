@@ -305,3 +305,19 @@ snapshot:
     - 环保
     - 煤炭
     - 机械设备
+
+# ---------- 纸上短线轮换引擎（strategy/paper_rotation.py，2026-10-16）----------
+# 定位：纸上模拟盘（account='rotation'）验证「短线打分轮动」；不做真实下单。
+# 明细设计见 docs/plans/2026-10-16-paper-rotation-design.md
+paper_rotation:
+  enabled: false                 # 默认关；显式 true 才在晨更链执行
+  account_name: rotation         # paper.db 内的独立账户（绒不触碰 default）
+  initial_cash: 1000000          # 虚拟初始资金
+  max_positions: 6               # 最大持仓数
+  max_weight_per_stock: 0.25     # 单票仓位上限（实际 min(可用现金÷待买数, 总资产×25%)）
+  top_n_buy: 3                   # 每日买入短线分数前 N
+  exit_rank_threshold: 10        # 分数衰减：掉出前 N 名卖出
+  min_hold_days: 3               # 最小持有交易日（仅约束非止损类卖出）
+  max_hold_days: 20              # 时间止损（horizon_hint 上限，交易日）
+  execution: next_open           # 信号次日开盘撑合（当前唯一支持值）
+  tech_source: "logs/tech_pitch_*.json"   # 短线分数来源（glob，取 mtime 最新）
