@@ -212,7 +212,12 @@ def check() -> int:
         _mx17, _n17 = None, 0
         for _c17 in _conns17:
             try:
-                _m = _c17.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
+                # ★2026-10-16 只认股票行（qfq，排除 SH./SZ. 指数）：MAX(date) 无过滤会取到
+                #   fetch_index_daily 写入的 SH.000300 指数行（adjust='none'，无 is_st）
+                #   → is_st=1 恒 0 → 每天假报「丢列异常」。与 cache.latest_trade_date 口径一致。
+                _m = _c17.execute(
+                    "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq' "
+                    "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%'").fetchone()[0]
                 if _m and (_mx17 is None or _m > _mx17):
                     _mx17 = _m
             except Exception:
