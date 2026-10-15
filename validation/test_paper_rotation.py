@@ -148,3 +148,18 @@ def test_buy_excludes_already_held():
     plan = pr.compute_buys(ranked_codes=ranked, scores=scores, holds=holds, cfg=cfg,
                            cash=500_000, equity=1_000_000)
     assert "A.SZ" not in [b["code"] for b in plan["buys"]]
+
+
+def test_run_once_dry_run_writes_nothing():
+    import strategy.paper_rotation as pr
+    r = pr.run_once(dry_run=True)
+    assert r["ok"] is True and r["dry_run"] is True
+    assert "sells" in r and "buys" in r and "pending_executed" in r
+    assert isinstance(r["sells"], list) and isinstance(r["buys"], list)
+
+
+def test_run_once_noop_when_disabled(monkeypatch):
+    import strategy.paper_rotation as pr
+    monkeypatch.setattr(pr, "load_rotation_cfg", lambda **kw: dict(pr.DEFAULTS))
+    r = pr.run_once()                            # enabled=False → 直接跳过，零副作用
+    assert r["ok"] is True and r.get("skipped") == "disabled"

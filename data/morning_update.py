@@ -94,6 +94,10 @@ def main():
              timeout=2700)
     run_step("Pitch v2 Deck", [PY, str(BASE / "factors" / "opportunities" / "pitch_v2.py")])
     run_step("科技线 Pitch v3", [PY, "-X", "utf8", str(BASE / "factors" / "opportunities" / "tech_pitch_v3.py")])
+    # ★2026-10-16 纸上短线轮换（paper_rotation）：独立账户 rotation，不影响任何台账/页面；
+    #   config paper_rotation.enabled=false 时内部直接跳过（零副作用）。
+    run_step("纸上短线轮换", [PY, "-X", "utf8", str(BASE / "strategy" / "paper_rotation.py")],
+             timeout=300)
     # 5) 日报
     run_step("每日决策日报", [PY, "-X", "utf8", str(BASE / "data" / "daily_report_auto.py")])
     log("=== 盘前数据更新链完成 ===")

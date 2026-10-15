@@ -102,7 +102,10 @@ def write_pending(db_path, signal_date: str, exec_date: str, orders: list) -> in
 
 
 def load_pending(db_path, exec_date: str) -> list:
-    """读某成交日的待执行订单（side DESC → sell 在前，先卖后买）"""
+    """读某成交日的待执行订单（side DESC → sell 在前，先卖后买）
+    表/库不存在 → 返回 []（首次运行/dry-run 安全，不抛异常）"""
+    if not Path(db_path).exists():
+        return []
     con = sqlite3.connect(str(db_path))
     try:
         cur = con.execute(
@@ -110,6 +113,8 @@ def load_pending(db_path, exec_date: str) -> list:
             "ORDER BY side DESC, code", (exec_date,))
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        return []          # rotation_pending 尚未创建（建表在非 dry-run 路径）
     finally:
         con.close()
 
@@ -182,3 +187,188 @@ def compute_buys(ranked_codes: list, scores: dict, holds: list, cfg: dict,
         buys.append({"code": c, "amount": round(amt, 2), "reason": "new_entry"})
         remaining -= amt
     return {"buys": buys}
+
+
+BARS_DB = BASE / "data" / "cache" / "bars.db"
+
+
+def _ranked_codes(scores: dict) -> list:
+    """短线分数降序的 code 列表"""
+    return [c for c, _ in sorted(scores.items(),
+                                 key=lambda kv: -float(kv[1].get("score") or 0.0))]
+
+
+def _bars_for(codes: list, date: str) -> dict:
+    """某日行情 {code: {open,high,low,close,preclose}}（qfq；无行情的 code 不在字典中）
+    用临时表传 code 列表（静态 SQL，无拼接注入面）"""
+    if not codes:
+        return {}
+    con = sqlite3.connect(f"file:{BARS_DB.as_posix()}?mode=ro&immutable=1",
+                          uri=True, timeout=5)
+    try:
+        con.execute("DROP TABLE IF EXISTS temp.q_codes")
+        con.execute("CREATE TEMP TABLE q_codes (code TEXT PRIMARY KEY)")
+        con.executemany("INSERT OR IGNORE INTO q_codes (code) VALUES (?)",
+                        [(c,) for c in codes])
+        cur = con.execute(
+            "SELECT code, open, high, low, close, preclose FROM daily_bar "
+            "WHERE date=? AND adjust='qfq' AND code IN (SELECT code FROM q_codes)",
+            (date,))
+        cols = [c[0] for c in cur.description]
+        return {r[0]: dict(zip(cols, r, strict=True)) for r in cur.fetchall()}
+    finally:
+        con.close()
+
+
+def _trade_days_held(entry_date: str, today: str) -> int:
+    """持有交易日数（bars.db 的 distinct date 计数，含首日与当日）"""
+    if not entry_date:
+        return 0
+    con = sqlite3.connect(f"file:{BARS_DB.as_posix()}?mode=ro&immutable=1",
+                          uri=True, timeout=5)
+    try:
+        n = con.execute(
+            "SELECT COUNT(DISTINCT date) FROM daily_bar WHERE adjust='qfq' "
+            "AND date>=? AND date<=?", (entry_date, today)).fetchone()[0]
+        return int(n or 0)
+    finally:
+        con.close()
+
+
+def _pending_codes(exec_date: str) -> set:
+    try:
+        return {o["code"] for o in load_pending(PAPER_DB, exec_date)}
+    except Exception:
+        return set()
+
+
+def _to_hold_rows(acc, today: str, bars: dict) -> list:
+    """PaperAccount 持仓 → compute_sells 行（附 hold_days / last_price）"""
+    rows = []
+    for p in (acc.positions() or []):
+        code = p.get("code")
+        if not code:
+            continue
+        bar = bars.get(code) or {}
+        rows.append({"code": code, "qty": p.get("qty"),
+                     "entry_date": p.get("entry_date"),
+                     "entry_price": p.get("avg_cost"),
+                     "last_price": bar.get("close"),
+                     "hold_days": _trade_days_held(p.get("entry_date") or "", today),
+                     "stop_plan": {}})
+    return rows
+
+
+def _execute_pending(acc, today: str, bars: dict, dry_run: bool) -> list:
+    """用今日开盘价撑合上一轮写入的 pending；一字板 → 作废，无行情 → 顺延"""
+    done = []
+    for o in load_pending(PAPER_DB, exec_date=today):
+        bar = bars.get(o["code"]) or {}
+        if is_limit_locked(bar):
+            print(f"[paper_rotation] {o['code']} {o['side']} 一字板 → 作废")
+            continue
+        px = bar.get("open")
+        if not px:
+            print(f"[paper_rotation] {o['code']} 无当日行情 → 顺延")
+            continue
+        if dry_run:
+            done.append({**o, "px": px})
+            continue
+        if o["side"] == "buy":
+            r = acc.buy(o["code"], int(o["qty"]), today, float(px), o.get("reason", ""))
+        else:
+            r = acc.sell(o["code"], int(o["qty"]), today, float(px), o.get("reason", ""))
+        if not (r or {}).get("ok"):
+            print(f"[paper_rotation] {o['code']} {o['side']} 撑合失败: {(r or {}).get('msg')}")
+        done.append({**o, "px": px})
+    return done
+
+
+def run_once(dry_run: bool = False, today: "str | None" = None) -> dict:
+    """每日一次：① 执行 pending（今日开盘价）② 算卖 ③ 算买 ④ 写新 pending（次日开盘）"""
+    import datetime as _dt
+    cfg = load_rotation_cfg()
+    if not cfg.get("enabled") and not dry_run:
+        return {"ok": True, "skipped": "disabled"}
+    today = today or _dt.date.today().strftime("%Y-%m-%d")
+    scores = load_shortline_scores(cfg["tech_source"])
+    if not scores:
+        print("[paper_rotation] 无短线产物 → 跳过本轮")
+        return {"ok": True, "skipped": "no_signal"}
+    ranked = _ranked_codes(scores)
+    top_n = int(cfg["top_n_buy"])
+    min_hold = int(cfg["min_hold_days"])
+
+    from strategy.paper_account import PaperAccount
+    acc = PaperAccount(name=str(cfg["account_name"]), cash=float(cfg["initial_cash"]))
+    if not dry_run:
+        ensure_pending_table(PAPER_DB)
+
+    # ① 执行上一轮 pending（今日开盘价）
+    codes = {p.get("code") for p in (acc.positions() or [])}
+    codes |= _pending_codes(today)
+    codes |= set(ranked[:top_n * 3])
+    bars = _bars_for(sorted(c for c in codes if c), today)
+    executed = _execute_pending(acc, today, bars, dry_run)
+
+    # ② 卖出（4 级优先级）
+    holds = _to_hold_rows(acc, today, bars)
+    sell_plan = compute_sells(holds, scores, cfg, ranked)
+    kept = list(sell_plan["kept"])
+    sells = list(sell_plan["sells"])
+
+    # ②b 替换式轮动（第 4 级）：有新高分标的要买但空位不足 → 卖 kept 中分数最低者
+    held_now = {h["code"] for h in kept}
+    want = [c for c in ranked[:top_n] if c not in held_now]
+    slots = max(0, int(cfg["max_positions"]) - len(kept))
+    need = max(0, len(want) - slots)
+    pool = [h for h in kept if int(h.get("hold_days") or 0) >= min_hold]
+    pool.sort(key=lambda h: float(scores.get(h["code"], {}).get("score") or -1.0))
+    for h in pool[:need]:
+        sells.append({"code": h["code"], "reason": "rotation", "qty": h.get("qty", 0)})
+        kept.remove(h)
+
+    # ③ 买入（现金 = 当前现金 + 卖出所得估算）
+    snap = acc.snapshot() or {}
+    cash_now = float(snap.get("cash") or 0.0)
+    for s in sells:
+        bar = bars.get(s["code"]) or {}
+        px = bar.get("close") or bar.get("open")
+        if px:
+            cash_now += float(px) * int(s.get("qty") or 0)
+    equity_now = cash_now + sum(
+        float((bars.get(h["code"]) or {}).get("close") or 0) * int(h.get("qty") or 0)
+        for h in kept)
+    buy_plan = compute_buys(ranked_codes=ranked, scores=scores, holds=kept, cfg=cfg,
+                            cash=cash_now, equity=equity_now)
+
+    # ④ 写新 pending（次日开盘成交）；qty 由金额/信号日收盘价换算（100 股一手）
+    orders = []
+    for s in sells:
+        orders.append({"code": s["code"], "side": "sell",
+                       "qty": int(s.get("qty") or 0), "reason": s["reason"]})
+    for b in buy_plan["buys"]:
+        px = float((bars.get(b["code"]) or {}).get("close") or 0)
+        qty = int(b["amount"] / px / 100) * 100 if px > 0 else 0
+        if qty > 0:
+            orders.append({"code": b["code"], "side": "buy",
+                           "qty": qty, "reason": b["reason"]})
+    if not dry_run and orders:
+        import datetime as _dt2
+        exec_date = (_dt2.date.fromisoformat(today) + _dt2.timedelta(days=1)).strftime("%Y-%m-%d")
+        write_pending(PAPER_DB, today, exec_date, orders)
+
+    return {"ok": True, "dry_run": dry_run, "date": today,
+            "pending_executed": executed, "sells": sells,
+            "buys": buy_plan["buys"], "orders_written": (0 if dry_run else len(orders))}
+
+
+def main() -> int:
+    import sys as _s
+    r = run_once(dry_run="--dry-run" in _s.argv)
+    print(f"[paper_rotation] {r}")
+    return 0 if r.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
