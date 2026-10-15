@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """data/morning_update.py - 盘前数据更新链（2026-08-21 用户需求：交易日 09:10 计划任务，
 2026-09-18 从 08:15 调晚，见下方★时序硬约束）
 
@@ -32,8 +31,9 @@ def log(msg: str):
     try:
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except OSError as e:
+        # 日志文件写入失败不阻断主链（print 已输出），但必须显式提示、不静默
+        print(f"[warn] 日志文件写入失败: {e}", flush=True)
 
 
 def run_step(name, cmd, timeout=1800):
@@ -58,7 +58,10 @@ def main():
         log(f"非交易日（{_d} 周末）-> 跳过晨更链（pitch 保持上一交易日数据）")
         return
     log("=== 盘前数据更新链启动 ===")
-    # 1) D 盘行情同步（只读挂载，幂等，约 4 分钟）
+    # 1) D 盘行情同步（只读挂载，幂等）
+    # ★2026-10-15 增量改造：import_from_ddrive.py 默认只导新交易日（秒级）；
+    #   原全量重导 13.86M 行耗时涨至 20+ 分钟，9/22 起连续 16 个交易日撞 1200s 超时
+    #   → bars.db 停在 09-18。现超时 1200s 仅兜底极端情况（源库 malformed 重试等）。
     run_step("D盘行情同步", [PY, "-X", "utf8", str(BASE / "data" / "import_from_ddrive.py")],
              timeout=1200)
     # 2) D 盘财报同步（幂等，约 20 秒）
