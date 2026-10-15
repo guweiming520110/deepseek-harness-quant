@@ -189,7 +189,7 @@ def rank(date: "str | None" = None, n: int = 30) -> dict:
     low52 = close.rolling(250, min_periods=150).min()
     vol20 = vx.rolling(20, min_periods=10).mean()
     vol60d = vx.rolling(60, min_periods=30).mean()
-    f = pd.DataFrame({
+    f: pd.DataFrame = pd.DataFrame({
         "vol60": vol60.iloc[-1],
         "mom120": mom120.iloc[-1],
         "max_ret20": max_ret20.iloc[-1],
@@ -232,13 +232,14 @@ def rank(date: "str | None" = None, n: int = 30) -> dict:
     st_codes = {r[0] for r in con.execute(
         "SELECT code FROM daily_bar WHERE date=? AND is_st=1", (last,)).fetchall()}
     con.close()
-    f = f[~f.index.isin(st_codes)]
+    # pd.DataFrame(...) 显式包装：pandas 存根对 .loc[boolean] 返回 Series|DataFrame 联合类型
+    f = pd.DataFrame(f.loc[~f.index.isin(st_codes)])
 
     # ---- 打分（加权分位：优中选优偏质量/成长，兼顾低波/超跌）----
     # ★2026-08-14 审计修复：lowvol/reversal 原 ascending=True 方向反（rank(pct, ascending=True)
     #   最小值得最小分位→低波/超跌最深反而最低分，三层池推荐"高波动+高动量"股）。
     #   改 ascending=False：波动最低/超跌最深得最高分（低波+反转实证方向）。
-    score = pd.DataFrame(index=f.index)
+    score: pd.DataFrame = pd.DataFrame(index=f.index)
     score["lowvol"] = f["vol60"].rank(pct=True, ascending=False)      # 波动低→高分
     score["reversal"] = f["mom120"].rank(pct=True, ascending=False)   # 超跌→高分（动量反向）
     score["quality"] = f["roe"].rank(pct=True, ascending=False)       # ROE 高→高分
