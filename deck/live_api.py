@@ -3159,6 +3159,38 @@ def live_data_assets() -> dict:
 _rt_cache = {"ts": 0.0, "data": None, "err": None}
 
 
+def _spot_valid(df) -> bool:
+    """实时快照有效性校验：最新价 >0 的比例过低（新浪 920 段占位垃圾全 0）判定为无效源。
+    ★2026-09-09 新浪 stock_zh_a_spot 对北交所 920 段解析失败，返回 5559 行全 0 占位。"""
+    if df is None or df.empty:
+        return False
+    import pandas as pd
+    price = pd.to_numeric(df.get("最新价"), errors="coerce") if "最新价" in df.columns else None
+    if price is None or price.notna().sum() < max(1, len(df) * 0.5):
+        return False
+    return int((price > 0).sum()) >= max(1, len(df) * 0.5)
+
+
+def _load_real_spot():
+    """多源实时快照：东财(em)优先 → 新浪(sina)备 → 双源均无效返回 (None, None, err)。
+    ★2026-09-09 东财 stock_zh_a_spot_em 当前 RemoteDisconnected（风控断连），新浪返回占位 0 ——
+    双源降级 + 有效性校验，避免向页面展示全 0 垃圾数据。"""
+    import akshare as _ak
+    _tries = [("em", _ak.stock_zh_a_spot_em), ("sina", _ak.stock_zh_a_spot)]
+    _errs = []
+    for _name, _fn in _tries:
+        try:
+            import socket as _sk
+            _sk.setdefaulttimeout(20)
+            _df = _fn()
+            if _spot_valid(_df):
+                return _df, _name, None
+            _errs.append(f"{_name}:invalid(占位/空)")
+        except Exception as _e:
+            _errs.append(f"{_name}:{str(_e)[:60]}")
+    return None, None, " | ".join(_errs)
+
+
 def live_realtime() -> dict:
     """盘中实时行情快照：涨跌家数/涨停数/成交额/涨跌幅分布/领涨领跌。
     数据源：新浪实时快照（akshare stock_zh_a_spot，60s 缓存）。
@@ -3172,14 +3204,28 @@ def live_realtime() -> dict:
     out = {"ok": True, "market_open": True,
            "ts": datetime.now().strftime("%H:%M:%S"),
            "source": "sina_realtime"}
+    # ★2026-10-16 非交易时段短路：盘前/盘后/周末不拉实时行情。
+    #   原实现先拉全市场（akshare，实测 34s 且失败）才置 market_open=False →
+    #   live_holdings 25~35s > 调用方 15s 超时 → 持仓页 pnl 拿不到（check_consistency
+    #   报「portfolio=0 vs pnl=None」的真因）。非交易时段直接用缓存/空快照返回。
+    import datetime as _dtm
+    _n = _dtm.datetime.now()
+    _hm = _n.hour * 100 + _n.minute
+    if _n.weekday() >= 5 or not (930 <= _hm <= 1500):
+        if _rt_cache["data"] is not None:
+            _prev = dict(_rt_cache["data"])
+            _prev["market_open"] = False
+            return _prev
+        out["ok"] = False
+        out["market_open"] = False
+        out["note"] = "非交易时段（未拉取实时行情）"
+        _rt_cache.update({"ts": now, "data": out})
+        return out
     try:
-        import socket as _sk
-        _sk.setdefaulttimeout(20)
-        import akshare as _ak
         import pandas as _pd
-        df = _ak.stock_zh_a_spot()   # 新浪全市场实时（5542 只）
-        if df is None or df.empty:
-            raise ValueError("空快照")
+        df, _src, _src_err = _load_real_spot()
+        if df is None:
+            raise ValueError(_src_err or "实时源无效")
         # 列名兼容（新浪：最新价/涨跌幅/成交额/成交量 等）
         cols = {c: c for c in df.columns}
         for a, b in [("最新价", "最新价"), ("涨跌幅", "涨跌幅"), ("成交额", "成交额"),
@@ -3217,7 +3263,18 @@ def live_realtime() -> dict:
                 _c = str(_codes.iloc[_i]).strip().lower()
                 if not _c or _c == "nan":
                     continue
-                _std = _c[2:] + "." + _c[:2].upper()
+                if _src == "em":
+                    # 东财源代码为纯数字（300684）/ 或带前缀；统一标准化为 300684.SZ
+                    if _c[:2] in ("sh", "sz", "bj"):
+                        _std = _c[2:] + "." + _c[:2].upper()
+                    else:
+                        _p = _c[:2]
+                        _ex = ("SH" if _p in ("60", "68")
+                               else "SZ" if _p in ("00", "30", "12", "20")
+                               else "BJ" if _p in ("4", "8", "92") else None)
+                        _std = (_c + "." + _ex) if _ex else _c
+                else:
+                    _std = _c[2:] + "." + _c[:2].upper()
                 _pr = price.iloc[_i]
                 _pc = chg.iloc[_i]
                 if _pr is not None and not _pd.isna(_pr):
@@ -3226,6 +3283,7 @@ def live_realtime() -> dict:
         except Exception:
             pass
         out.update({
+            "source": _src,          # ★真实使用的实时源（em/sina），前端可标注
             "n_stocks": int(len(df)),
             "up": up, "down": down, "flat": flat,
             "limit_up": limit_up, "limit_down": limit_down,
