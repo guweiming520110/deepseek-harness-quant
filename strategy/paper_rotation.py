@@ -7,9 +7,11 @@ import glob
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE))   # 支持 `python strategy/paper_rotation.py` 独立运行
 
 DEFAULTS = {
     "enabled": False, "account_name": "rotation", "initial_cash": 1000000,
