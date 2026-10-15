@@ -163,3 +163,13 @@ def test_run_once_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(pr, "load_rotation_cfg", lambda **kw: dict(pr.DEFAULTS))
     r = pr.run_once()                            # enabled=False → 直接跳过，零副作用
     assert r["ok"] is True and r.get("skipped") == "disabled"
+
+
+def test_report_shapes_and_benchmark():
+    import strategy.paper_rotation_report as rep
+    r = rep.build_report()
+    assert set(r) >= {"nav_curve", "turnover", "fees", "max_drawdown", "benchmark"}
+    assert isinstance(r["nav_curve"], list)
+    assert isinstance(r["turnover"], int)
+    assert r["fees"] >= 0 and 0.0 <= r["max_drawdown"] <= 1.0
+    assert isinstance(r["benchmark"], dict)
