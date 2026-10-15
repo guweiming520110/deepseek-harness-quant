@@ -159,3 +159,26 @@ def compute_sells(holds: list, scores: dict, cfg: dict, ranked_codes: list) -> d
         else:
             kept.append(h)
     return {"sells": sells, "kept": kept}
+
+
+def compute_buys(ranked_codes: list, scores: dict, holds: list, cfg: dict,
+                 cash: float, equity: float) -> dict:
+    """候选 = 排名前 top_n_buy，剔除已持仓；数量 = min(候选, 剩余仓位)
+    单票金额 = min(可用现金÷待买只数, 总资产×max_weight_per_stock) —— 天然满足
+    「6 只时每只≈16.7%、单票不超 25%」"""
+    top_n = int(cfg["top_n_buy"])
+    cap = float(cfg["max_weight_per_stock"])
+    free_slots = max(0, int(cfg["max_positions"]) - len(holds))
+    held = {h["code"] for h in holds}
+    cand = [c for c in ranked_codes[:top_n * 3] if c not in held][:top_n][:free_slots]
+    if not cand or cash <= 0 or equity <= 0:
+        return {"buys": []}
+    per = min(cash / len(cand), equity * cap)
+    buys, remaining = [], float(cash)
+    for c in cand:
+        amt = min(per, remaining)
+        if amt <= 0:
+            break
+        buys.append({"code": c, "amount": round(amt, 2), "reason": "new_entry"})
+        remaining -= amt
+    return {"buys": buys}

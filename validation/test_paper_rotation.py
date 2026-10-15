@@ -114,3 +114,37 @@ def test_time_stop_after_max_hold_days():
     h = _hold("T.SZ", days=21)                                 # 超 20 交易日
     plan = pr.compute_sells([h], {}, cfg, ranked_codes=["T.SZ"])
     assert plan["sells"][0]["reason"] == "time_stop"
+
+
+def test_buy_picks_top_n_and_respects_cap():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS)                     # top_n_buy=3, cap=0.25, max_positions=6
+    ranked = [f"C{i}.SZ" for i in range(5)]
+    scores = {c: {"score": 100 - i} for i, c in enumerate(ranked)}
+    plan = pr.compute_buys(ranked_codes=ranked, scores=scores, holds=[], cfg=cfg,
+                           cash=1_000_000, equity=1_000_000)
+    assert len(plan["buys"]) == 3                                    # 只买前 3
+    assert [b["code"] for b in plan["buys"]] == ["C0.SZ", "C1.SZ", "C2.SZ"]
+    for b in plan["buys"]:
+        assert b["amount"] <= 1_000_000 * 0.25 + 1e-6                # 单票不超 25%
+    assert sum(b["amount"] for b in plan["buys"]) <= 1_000_000
+
+
+def test_buy_skips_existing_and_respects_max_positions():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS, max_positions=6)
+    holds = [{"code": f"H{i}.SZ", "qty": 100} for i in range(6)]      # 已满仓
+    plan = pr.compute_buys(ranked_codes=["N.SZ"], scores={"N.SZ": {"score": 99}},
+                           holds=holds, cfg=cfg, cash=100_000, equity=1_000_000)
+    assert plan["buys"] == []                                        # 满仓不买
+
+
+def test_buy_excludes_already_held():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS)
+    ranked = ["A.SZ", "B.SZ", "C.SZ", "D.SZ"]
+    scores = {c: {"score": 90} for c in ranked}
+    holds = [{"code": "A.SZ", "qty": 100}]                          # A 已持仓
+    plan = pr.compute_buys(ranked_codes=ranked, scores=scores, holds=holds, cfg=cfg,
+                           cash=500_000, equity=1_000_000)
+    assert "A.SZ" not in [b["code"] for b in plan["buys"]]
