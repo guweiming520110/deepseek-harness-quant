@@ -51,3 +51,25 @@ def test_load_shortline_scores_parses_entries():
         assert isinstance(v["score"], (int, float))
     # 文件不存在时必须返回空 dict（不抛异常）
     assert pr.load_shortline_scores(pattern="logs/__no_such__*.json") == {}
+
+
+def test_pending_table_and_roundtrip(tmp_path):
+    import strategy.paper_rotation as pr
+    db = tmp_path / "paper.db"
+    pr.ensure_pending_table(db)
+    pr.write_pending(db, "2026-10-15", "2026-10-16",
+                     [{"code": "300300.SZ", "side": "buy", "qty": 100,
+                       "reason": "new_entry"}])
+    rows = pr.load_pending(db, exec_date="2026-10-16")
+    assert len(rows) == 1 and rows[0]["code"] == "300300.SZ" and rows[0]["side"] == "buy"
+
+
+def test_is_limit_locked_detects_one_way_board():
+    import strategy.paper_rotation as pr
+    # 开盘=最高=最低 且 涨幅≥9.8% → 一字板（买不到/卖不掉）
+    assert pr.is_limit_locked({"open": 11.0, "high": 11.0, "low": 11.0,
+                               "preclose": 10.0, "close": 11.0}) is True
+    assert pr.is_limit_locked({"open": 10.5, "high": 11.0, "low": 10.2,
+                               "preclose": 10.0, "close": 10.8}) is False
+    assert pr.is_limit_locked({"open": None, "high": None, "low": None,
+                               "preclose": None, "close": None}) is False

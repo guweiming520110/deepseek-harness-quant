@@ -6,6 +6,7 @@
 import glob
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -56,3 +57,68 @@ def load_shortline_scores(pattern: str = "logs/tech_pitch_*.json") -> dict:
                      "name": e.get("name") or code,
                      "horizon_days": 20}
     return out
+
+
+PAPER_DB = BASE / "data" / "cache" / "paper.db"
+
+_PENDING_DDL = """
+CREATE TABLE IF NOT EXISTS rotation_pending (
+  signal_date TEXT NOT NULL, exec_date TEXT NOT NULL,
+  code TEXT NOT NULL, side TEXT NOT NULL, qty INTEGER NOT NULL,
+  reason TEXT, created_at TEXT,
+  PRIMARY KEY (signal_date, code, side)
+);
+"""
+
+
+def ensure_pending_table(db_path=None) -> None:
+    """建 pending 表（幂等；与 PaperAccount 同库不同表，不改其 schema）"""
+    p = Path(db_path or PAPER_DB)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(p))
+    try:
+        con.execute(_PENDING_DDL)
+        con.commit()
+    finally:
+        con.close()
+
+
+def write_pending(db_path, signal_date: str, exec_date: str, orders: list) -> int:
+    """写入待执行订单（T-1 出单、T 日开盘撑合）；同主键覆盖，幂等重跑安全"""
+    import datetime as _dt
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.executemany(
+            "INSERT OR REPLACE INTO rotation_pending "
+            "(signal_date, exec_date, code, side, qty, reason, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [(signal_date, exec_date, o["code"], o["side"], int(o["qty"]),
+              o.get("reason", ""),
+              _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for o in orders])
+        con.commit()
+    finally:
+        con.close()
+    return len(orders)
+
+
+def load_pending(db_path, exec_date: str) -> list:
+    """读某成交日的待执行订单（side DESC → sell 在前，先卖后买）"""
+    con = sqlite3.connect(str(db_path))
+    try:
+        cur = con.execute(
+            "SELECT code, side, qty, reason FROM rotation_pending WHERE exec_date=? "
+            "ORDER BY side DESC, code", (exec_date,))
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+
+def is_limit_locked(bar: dict) -> bool:
+    """一字板（开盘即封死）：open==high==low 且偏离前收 ≥9.8%（含 10%/20% 板块近似）
+    任一字段缺失 → 视为非一字板（保守，不拦单）"""
+    o, h, low, pc = (float(bar.get(k) or 0)
+                     for k in ("open", "high", "low", "preclose"))
+    if not (o and h and low and pc):
+        return False
+    return abs(o - h) < 1e-9 and abs(o - low) < 1e-9 and abs(o / pc - 1) >= 0.098
