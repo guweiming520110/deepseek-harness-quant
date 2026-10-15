@@ -41,12 +41,19 @@ def _api(path: str) -> dict:
 
 def check() -> int:
     fails = 0
+    _dg: dict = {}   # ★实盘裁决数据：第 14 项 try 失败时保持空，避免第 16 项 NameError（真缺陷）
 
     def _row(name, ok, detail=""):
         nonlocal fails
         if not ok:
             fails += 1
         print(f"  {'✅' if ok else '⚠️'} {name} {detail}")
+
+    # ★2026-10-16 外包因子池缺失探测：daily_scores / risk_multiplier 均无产出时，
+    #   依赖它们的检查项（强因子直通 / FRC 系数）属「外部依赖缺失」而非故障，
+    #   与 verify_day_pipeline 的同名处理一致（避免假红淹没真故障）。
+    _ext_missing = (not glob.glob("data/factorpool/output/daily_scores/daily_*.csv")
+                    and not glob.glob("data/factorpool/risk/risk_multiplier_*.json"))
 
     print("=== 数据一致性交叉校验 ===")
     # 1) Pitch 数：opp_pool 未过滤（含持有期不足）vs pitch_v2 已过滤（Pitch 页展示源）
@@ -117,8 +124,9 @@ def check() -> int:
         n_sh_pool = sum(1 for o in lo.get("opportunities", []) if o.get("strong_hit"))
     except Exception:
         n_sh, n_sh_pool = -1, -1
-    _row("强因子直通", n_sh > 0 and n_sh_pool <= n_sh,
-         f"跨家族 {n_sh} 只 ≥ 机会池内标注 {n_sh_pool}")
+    _row("强因子直通", _ext_missing or (n_sh > 0 and n_sh_pool <= n_sh),
+         f"跨家族 {n_sh} 只 ≥ 机会池内标注 {n_sh_pool}"
+         + ("（外包因子池缺失，外部依赖）" if _ext_missing else ""))
     # 9) ★择时系统 v4（百轮#66/#91/#105）：文件可读 + 四维齐全（政策=四因子评分，宏观=regime+社融/利率修正）
     _tm = _latest("timing_system_*.json", "output")
     _dims = _tm.get("dims", {})
@@ -141,7 +149,9 @@ def check() -> int:
                 continue
     except Exception:
         _rm_n, _rm_best = 0, None
-    _row("FRC 系数", _rm_n > 30, f"{_rm_n} 因子" + (f"（{Path(_rm_best).name if _rm_best else '缺失'}）"))
+    _row("FRC 系数", _ext_missing or _rm_n > 30,
+         f"{_rm_n} 因子" + (f"（{Path(_rm_best).name if _rm_best else '缺失'}）")
+         + ("（外包因子池缺失，外部依赖）" if _ext_missing else ""))
     # 11) ★日历层（百轮#65）：get_window 可调用（当前窗口零副作用）
     try:
         from data.calendar_hook import get_window
