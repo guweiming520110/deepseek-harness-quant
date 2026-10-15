@@ -73,3 +73,44 @@ def test_is_limit_locked_detects_one_way_board():
                                "preclose": 10.0, "close": 10.8}) is False
     assert pr.is_limit_locked({"open": None, "high": None, "low": None,
                                "preclose": None, "close": None}) is False
+
+
+def _hold(code, entry="2026-10-01", days=5, cost=10.0, last=9.0):
+    return {"code": code, "entry_date": entry, "hold_days": days,
+            "entry_price": cost, "last_price": last, "stop_plan": {}}
+
+
+def test_sell_priority_order_and_min_hold():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS, min_hold_days=3, exit_rank_threshold=10, max_hold_days=20)
+    holds = [_hold("A.SZ", days=5), _hold("B.SZ", days=2)]     # B 未满最小持有期
+    ranked = ["A.SZ", "B.SZ"] + [f"X{i}.SZ" for i in range(9)]
+    plan = pr.compute_sells(holds, {}, cfg, ranked_codes=ranked)
+    assert plan["sells"] == []                                 # 都在前 10 → 不触发衰减
+
+
+def test_sell_triggered_by_rank_decay_after_min_hold():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS, min_hold_days=3, exit_rank_threshold=10)
+    holds = [_hold("Z.SZ", days=5)]
+    ranked = [f"X{i}.SZ" for i in range(10)]                   # Z 不在前 10
+    plan = pr.compute_sells(holds, {"Z.SZ": {"score": 1}}, cfg, ranked_codes=ranked)
+    assert [s["code"] for s in plan["sells"]] == ["Z.SZ"]
+    assert plan["sells"][0]["reason"] == "rank_decay"
+
+
+def test_stop_loss_bypasses_min_hold():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS, min_hold_days=3)
+    h = _hold("S.SZ", days=1, cost=10.0, last=8.5)
+    h["stop_plan"] = {"stop_loss_pct": 0.10}                   # 亏 15% > 10% → 止损
+    plan = pr.compute_sells([h], {}, cfg, ranked_codes=[])
+    assert plan["sells"][0]["reason"] == "stop"                # 止损不受最小持有期约束
+
+
+def test_time_stop_after_max_hold_days():
+    import strategy.paper_rotation as pr
+    cfg = dict(pr.DEFAULTS, min_hold_days=3, max_hold_days=20)
+    h = _hold("T.SZ", days=21)                                 # 超 20 交易日
+    plan = pr.compute_sells([h], {}, cfg, ranked_codes=["T.SZ"])
+    assert plan["sells"][0]["reason"] == "time_stop"

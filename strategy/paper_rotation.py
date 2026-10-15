@@ -122,3 +122,40 @@ def is_limit_locked(bar: dict) -> bool:
     if not (o and h and low and pc):
         return False
     return abs(o - h) < 1e-9 and abs(o - low) < 1e-9 and abs(o / pc - 1) >= 0.098
+
+
+def compute_sells(holds: list, scores: dict, cfg: dict, ranked_codes: list) -> dict:
+    """4 级优先级卖出：stop > time_stop > rank_decay
+    （第 4 级「替换式轮动」满仓时由调用方在 compute_buys 前补齐）
+
+    ranked_codes：短线分数降序的 code 列表（前 exit_rank_threshold 名视为仍在榜）
+    返回 {"sells": [{"code","reason","qty"}], "kept": [...]}
+    """
+    top_set = set(ranked_codes[:int(cfg["exit_rank_threshold"])])
+    min_hold = int(cfg["min_hold_days"])
+    max_hold = int(cfg["max_hold_days"])
+    sells, kept = [], []
+    for h in holds:
+        code = h["code"]
+        days = int(h.get("hold_days") or 0)
+        plan = h.get("stop_plan") or {}
+        last, cost = h.get("last_price"), h.get("entry_price")
+        ret = None
+        if last is not None and cost:
+            ret = float(last) / float(cost) - 1
+        reason = None
+        # 1) 止损（不受最小持有期约束 —— 风险优先）
+        sl = plan.get("stop_loss_pct")
+        if sl and ret is not None and ret <= -abs(float(sl)):
+            reason = "stop"
+        # 2) 时间止损
+        elif days > max_hold:
+            reason = "time_stop"
+        # 3/4) 分数衰减（须满足最小持有期）
+        elif days >= min_hold and code not in top_set:
+            reason = "rank_decay"
+        if reason:
+            sells.append({"code": code, "reason": reason, "qty": h.get("qty", 0)})
+        else:
+            kept.append(h)
+    return {"sells": sells, "kept": kept}
